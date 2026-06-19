@@ -1,0 +1,140 @@
+#!/bin/bash
+set -euo pipefail
+
+OCSERV_NET_ENV="/etc/ocserv/ocserv-net.env"
+NFT_TABLE="ocserv"
+
+usage() {
+    cat <<EOF
+Usage: $0 <up|down>
+
+Bring ocserv NAT/forwarding rules up or down.
+Configuration is read from ${OCSERV_NET_ENV}.
+Invoked automatically by the ocserv systemd service lifecycle.
+EOF
+    exit 1
+}
+
+[ $# -eq 1 ] || usage
+ACTION="$1"
+[[ "$ACTION" == "up" || "$ACTION" == "down" ]] || usage
+
+[ -f "$OCSERV_NET_ENV" ] || { echo "ERROR: $OCSERV_NET_ENV not found. Run deploy.sh first." >&2; exit 1; }
+# shellcheck source=/dev/null
+source "$OCSERV_NET_ENV"
+
+have_nftables() { command -v nft &>/dev/null; }
+
+# --- nftables implementation ---
+
+nft_up() {
+    # Remove stale table if present (idempotent re-apply)
+    nft delete table ip "$NFT_TABLE" 2>/dev/null || true
+
+    nft add table ip "$NFT_TABLE"
+
+    # NAT: masquerade VPN traffic out of egress interface
+    nft add chain ip "$NFT_TABLE" postrouting \
+        '{ type nat hook postrouting priority srcnat; policy accept; }'
+    nft add rule ip "$NFT_TABLE" postrouting \
+        ip saddr "$VPN_NETWORK" oifname "$EGRESS_IFACE" masquerade
+
+    # Forward: VPN <-> egress
+    nft add chain ip "$NFT_TABLE" forward \
+        '{ type filter hook forward priority filter; policy accept; }'
+    nft add rule ip "$NFT_TABLE" forward \
+        iifname "$VPN_DEVICE" oifname "$EGRESS_IFACE" accept
+    nft add rule ip "$NFT_TABLE" forward \
+        iifname "$EGRESS_IFACE" oifname "$VPN_DEVICE" \
+        ct state established,related accept
+
+    # Input: accept VPN port
+    nft add chain ip "$NFT_TABLE" input \
+        '{ type filter hook input priority filter; policy accept; }'
+    nft add rule ip "$NFT_TABLE" input tcp dport "$TCP_PORT" accept
+    nft add rule ip "$NFT_TABLE" input udp dport "$UDP_PORT" accept
+}
+
+nft_down() {
+    nft delete table ip "$NFT_TABLE" 2>/dev/null || true
+}
+
+# --- iptables fallback ---
+
+ipt_comment="ocserv-vpn"
+
+ipt_up() {
+    iptables -t nat -A POSTROUTING \
+        -s "$VPN_NETWORK" -o "$EGRESS_IFACE" \
+        -m comment --comment "$ipt_comment" -j MASQUERADE
+
+    iptables -A FORWARD \
+        -i "$VPN_DEVICE" -o "$EGRESS_IFACE" \
+        -m comment --comment "$ipt_comment" -j ACCEPT
+
+    iptables -A FORWARD \
+        -i "$EGRESS_IFACE" -o "$VPN_DEVICE" \
+        -m state --state ESTABLISHED,RELATED \
+        -m comment --comment "$ipt_comment" -j ACCEPT
+
+    iptables -A INPUT -p tcp --dport "$TCP_PORT" \
+        -m comment --comment "$ipt_comment" -j ACCEPT
+
+    iptables -A INPUT -p udp --dport "$UDP_PORT" \
+        -m comment --comment "$ipt_comment" -j ACCEPT
+}
+
+ipt_rule_exists() {
+    iptables -C "$@" 2>/dev/null
+}
+
+ipt_down() {
+    # Delete rules idempotently (loop until gone in case of duplicates)
+    while ipt_rule_exists FORWARD \
+            -i "$VPN_DEVICE" -o "$EGRESS_IFACE" \
+            -m comment --comment "$ipt_comment" -j ACCEPT 2>/dev/null; do
+        iptables -D FORWARD \
+            -i "$VPN_DEVICE" -o "$EGRESS_IFACE" \
+            -m comment --comment "$ipt_comment" -j ACCEPT
+    done
+
+    while ipt_rule_exists FORWARD \
+            -i "$EGRESS_IFACE" -o "$VPN_DEVICE" \
+            -m state --state ESTABLISHED,RELATED \
+            -m comment --comment "$ipt_comment" -j ACCEPT 2>/dev/null; do
+        iptables -D FORWARD \
+            -i "$EGRESS_IFACE" -o "$VPN_DEVICE" \
+            -m state --state ESTABLISHED,RELATED \
+            -m comment --comment "$ipt_comment" -j ACCEPT
+    done
+
+    while ipt_rule_exists INPUT -p tcp --dport "$TCP_PORT" \
+            -m comment --comment "$ipt_comment" -j ACCEPT 2>/dev/null; do
+        iptables -D INPUT -p tcp --dport "$TCP_PORT" \
+            -m comment --comment "$ipt_comment" -j ACCEPT
+    done
+
+    while ipt_rule_exists INPUT -p udp --dport "$UDP_PORT" \
+            -m comment --comment "$ipt_comment" -j ACCEPT 2>/dev/null; do
+        iptables -D INPUT -p udp --dport "$UDP_PORT" \
+            -m comment --comment "$ipt_comment" -j ACCEPT
+    done
+
+    # NAT rule — iptables -C doesn't support -t nat cleanly with all options, use -D directly
+    iptables -t nat -D POSTROUTING \
+        -s "$VPN_NETWORK" -o "$EGRESS_IFACE" \
+        -m comment --comment "$ipt_comment" -j MASQUERADE 2>/dev/null || true
+}
+
+# --- Dispatch ---
+
+# Ensure IP forwarding is live (in case sysctl hasn't applied yet)
+if [[ "$ACTION" == "up" ]]; then
+    echo 1 > /proc/sys/net/ipv4/ip_forward
+fi
+
+if have_nftables; then
+    "nft_${ACTION}"
+else
+    "ipt_${ACTION}"
+fi

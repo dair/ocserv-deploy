@@ -1,0 +1,260 @@
+#!/bin/bash
+set -euo pipefail
+
+OCSERV_SSL_DIR="/etc/ocserv/ssl"
+OCSERV_PASSWD="/etc/ocserv/ocpasswd"
+ISSUED_DIR="${OCSERV_SSL_DIR}/issued"
+REVOKED_DIR="${OCSERV_SSL_DIR}/revoked"
+CA_CERT="${OCSERV_SSL_DIR}/ca-cert.pem"
+CA_KEY="${OCSERV_SSL_DIR}/ca-key.pem"
+
+die()  { echo "ERROR: $*" >&2; exit 1; }
+warn() { echo "WARNING: $*" >&2; }
+log()  { echo "==> $*"; }
+
+usage() {
+    cat <<EOF
+Usage: $0 <subcommand> [options]
+
+Subcommands:
+  add-cert <username> [--days N] [--out DIR] [--p12 [--p12-pass PASS]]
+      Issue a client certificate. Outputs key, cert, and CA cert to DIR
+      (default: current directory). --p12 also creates a PKCS#12 bundle.
+
+  add-pass <username>
+      Create or update a password user (prompts for password).
+
+  del <username>
+      Remove user from password file and/or revoke their certificate.
+      Note: revocation blocks reconnect; active sessions are not terminated.
+
+  list
+      List all password users and issued/revoked certificates.
+
+  -h, --help
+      Show this help.
+
+EOF
+    exit 0
+}
+
+# --- Prerequisite check ---
+preflight() {
+    [[ $EUID -eq 0 ]] || die "Must be run as root"
+    [ -d "$OCSERV_SSL_DIR" ] || die "PKI directory not found: $OCSERV_SSL_DIR. Run deploy.sh first."
+}
+
+# --- Certificate revocation list rebuild ---
+regen_crl() {
+    local load_certs=()
+    for f in "${REVOKED_DIR}"/*.pem; do
+        [ -f "$f" ] && load_certs+=( "--load-certificate" "$f" )
+    done
+
+    local tmpl; tmpl=$(mktemp)
+    echo "crl_next_update = 365" > "$tmpl"
+
+    certtool --generate-crl \
+        --load-ca-privkey "$CA_KEY" \
+        --load-ca-certificate "$CA_CERT" \
+        "${load_certs[@]}" \
+        --template "$tmpl" \
+        --outfile "${OCSERV_SSL_DIR}/crl.pem" 2>/dev/null
+
+    rm -f "$tmpl"
+
+    # Signal ocserv to reload CRL (below-SIGHUP option)
+    if systemctl is-active --quiet ocserv 2>/dev/null; then
+        systemctl reload ocserv
+        log "Signaled ocserv to reload CRL"
+    fi
+}
+
+# --- add-cert ---
+cmd_add_cert() {
+    local username="" days=3650 out_dir="." do_p12=0 p12_pass=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --days)     days="$2";     shift 2 ;;
+            --out)      out_dir="$2";  shift 2 ;;
+            --p12)      do_p12=1;      shift ;;
+            --p12-pass) p12_pass="$2"; shift 2 ;;
+            -*)         die "Unknown option: $1" ;;
+            *)
+                [ -z "$username" ] || die "Unexpected argument: $1"
+                username="$1"; shift ;;
+        esac
+    done
+
+    [ -n "$username" ] || die "Usage: $0 add-cert <username> [--days N] [--out DIR] [--p12 [--p12-pass PASS]]"
+    [[ "$username" =~ ^[a-zA-Z0-9._-]+$ ]] || die "Username must contain only: a-z A-Z 0-9 . _ -"
+
+    [ -f "$CA_CERT" ] || die "CA certificate not found: $CA_CERT"
+    [ -f "$CA_KEY"  ] || die "CA key not found: $CA_KEY"
+
+    mkdir -p "$out_dir" "$ISSUED_DIR"
+
+    local key_file="${out_dir}/${username}-key.pem"
+    local cert_file="${out_dir}/${username}-cert.pem"
+    local issued_copy="${ISSUED_DIR}/${username}-cert.pem"
+
+    # Revoke any previously issued cert for this user before re-issuing
+    if [ -f "$issued_copy" ]; then
+        warn "Revoking previously issued certificate for '$username' before re-issuing"
+        mkdir -p "$REVOKED_DIR"
+        mv "$issued_copy" "${REVOKED_DIR}/${username}-prev-$(date +%Y%m%d%H%M%S)-cert.pem"
+        regen_crl
+    fi
+
+    log "Generating certificate for '$username'"
+
+    local tmpl; tmpl=$(mktemp)
+    cat > "$tmpl" <<EOF
+cn = "${username}"
+unit = "users"
+tls_www_client
+signing_key
+encryption_key
+expiration_days = ${days}
+EOF
+
+    certtool --generate-privkey --outfile "$key_file" 2>/dev/null
+    chmod 600 "$key_file"
+
+    certtool --generate-certificate \
+        --load-privkey "$key_file" \
+        --load-ca-certificate "$CA_CERT" \
+        --load-ca-privkey "$CA_KEY" \
+        --template "$tmpl" \
+        --outfile "$cert_file" 2>/dev/null
+
+    rm -f "$tmpl"
+    chmod 644 "$cert_file"
+
+    # Keep a copy for future revocation
+    cp "$cert_file" "$issued_copy"
+    chmod 640 "$issued_copy"
+
+    # Always copy CA cert so client has everything they need
+    cp "$CA_CERT" "${out_dir}/ca-cert.pem"
+
+    # Optional PKCS#12 bundle
+    if (( do_p12 )); then
+        local p12_file="${out_dir}/${username}.p12"
+        if [ -z "$p12_pass" ]; then
+            read -rs -p "PKCS#12 export password (may be empty): " p12_pass
+            echo
+        fi
+        certtool --to-p12 \
+            --load-privkey "$key_file" \
+            --load-certificate "$cert_file" \
+            --p12-name "$username" \
+            --password "$p12_pass" \
+            --outfile "$p12_file" 2>/dev/null
+        chmod 600 "$p12_file"
+        log "Created PKCS#12 bundle: $p12_file"
+    fi
+
+    echo
+    echo "  Files written to: $out_dir"
+    echo "    ${username}-key.pem   — private key (keep confidential)"
+    echo "    ${username}-cert.pem  — client certificate"
+    echo "    ca-cert.pem           — CA certificate (client uses to trust server)"
+    (( do_p12 )) && echo "    ${username}.p12       — PKCS#12 bundle"
+    echo
+    echo "  Transfer these files to the client and import into the VPN client."
+    echo
+}
+
+# --- add-pass ---
+cmd_add_pass() {
+    [ $# -ge 1 ] || die "Usage: $0 add-pass <username>"
+    local username="$1"
+    [[ "$username" =~ ^[a-zA-Z0-9._-]+$ ]] || die "Username must contain only: a-z A-Z 0-9 . _ -"
+
+    [ -f "$OCSERV_PASSWD" ] || die "Password file not found: $OCSERV_PASSWD. Run deploy.sh first."
+
+    log "Setting password for '$username'"
+    ocpasswd -c "$OCSERV_PASSWD" "$username"
+    echo "Password set. Changes take effect immediately (no reload required)."
+}
+
+# --- del ---
+cmd_del() {
+    [ $# -ge 1 ] || die "Usage: $0 del <username>"
+    local username="$1"
+    local removed=0
+
+    # Remove from password file
+    if [ -f "$OCSERV_PASSWD" ] && grep -q "^${username}:" "$OCSERV_PASSWD" 2>/dev/null; then
+        ocpasswd -c "$OCSERV_PASSWD" -d "$username"
+        log "Removed password user '$username'"
+        (( removed++ ))
+    fi
+
+    # Revoke certificate
+    local issued_cert="${ISSUED_DIR}/${username}-cert.pem"
+    if [ -f "$issued_cert" ]; then
+        mkdir -p "$REVOKED_DIR"
+        mv "$issued_cert" "${REVOKED_DIR}/${username}-cert.pem"
+        regen_crl
+        log "Revoked certificate for '$username'"
+        echo "Note: active sessions are not terminated; revocation blocks reconnect."
+        (( removed++ ))
+    fi
+
+    (( removed > 0 )) || warn "No password entry or certificate found for '$username'"
+}
+
+# --- list ---
+cmd_list() {
+    echo
+    echo "=== Password users ==="
+    if [ -f "$OCSERV_PASSWD" ] && [ -s "$OCSERV_PASSWD" ]; then
+        grep -v '^[[:space:]]*#' "$OCSERV_PASSWD" | cut -d: -f1 | sort | while read -r u; do
+            echo "  $u"
+        done
+    else
+        echo "  (none)"
+    fi
+
+    echo
+    echo "=== Certificate users (active) ==="
+    if [ -d "$ISSUED_DIR" ] && compgen -G "${ISSUED_DIR}/*.pem" &>/dev/null; then
+        for f in "${ISSUED_DIR}"/*.pem; do
+            local u="${f##*/}"; u="${u%-cert.pem}"
+            local expiry
+            expiry=$(certtool --certificate-info --infile "$f" 2>/dev/null \
+                | awk '/Not After:/{$1=$2=""; print $0}' | sed 's/^ *//')
+            printf "  %-20s (expires: %s)\n" "$u" "$expiry"
+        done
+    else
+        echo "  (none)"
+    fi
+
+    echo
+    echo "=== Revoked certificates ==="
+    if [ -d "$REVOKED_DIR" ] && compgen -G "${REVOKED_DIR}/*.pem" &>/dev/null; then
+        for f in "${REVOKED_DIR}"/*.pem; do
+            local u="${f##*/}"; u="${u%-cert.pem}"
+            echo "  $u"
+        done
+    else
+        echo "  (none)"
+    fi
+    echo
+}
+
+# --- Dispatch ---
+preflight
+
+[ $# -ge 1 ] || usage
+case "$1" in
+    add-cert) shift; cmd_add_cert "$@" ;;
+    add-pass) shift; cmd_add_pass "$@" ;;
+    del)      shift; cmd_del      "$@" ;;
+    list)            cmd_list           ;;
+    -h|--help)       usage              ;;
+    *) die "Unknown subcommand: $1. Use --help for usage." ;;
+esac
